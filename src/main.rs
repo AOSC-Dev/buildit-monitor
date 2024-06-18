@@ -9,11 +9,14 @@ use eyre::{Context, Result};
 use futures_channel::mpsc::{unbounded, UnboundedSender};
 use futures_util::{future, pin_mut, StreamExt, TryStreamExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::tungstenite::Message;
-use tracing::{info, level_filters::LevelFilter};
+use tokio_tungstenite::tungstenite::{
+    handshake::server::{ErrorResponse, Request, Response},
+    Message,
+};
+use tracing::{error, info, level_filters::LevelFilter};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
-type Tx = UnboundedSender<Message>;
+type Tx = (UnboundedSender<Message>, String);
 type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
 
 #[tokio::main]
@@ -66,31 +69,49 @@ async fn handle_connection(
     peer_map: PeerMap,
 ) -> Result<()> {
     info!("New connect: {addr}");
-    let ws_stream = tokio_tungstenite::accept_async(raw_stream)
+    let mut path = None;
+    let callback = |req: &Request, res: Response| -> Result<Response, ErrorResponse> {
+        path = Some(req.uri().path().to_string());
+        Ok(res)
+    };
+
+    let ws_stream = tokio_tungstenite::accept_hdr_async(raw_stream, callback)
         .await
         .context("Error during the websocket handshake occurred")?;
+
+    if path.is_none() {
+        error!("{addr} request has no path params.");
+        return Ok(());
+    }
+
+    let path = path.unwrap();
 
     let (outgoing, incoming) = ws_stream.split();
 
     let (tx, rx) = unbounded();
-    peer_map.lock().unwrap().insert(addr, tx);
+    peer_map.lock().unwrap().insert(addr, (tx, path.clone()));
 
     let broadcast_incoming = incoming.try_for_each(|msg| {
         info!(
-            "Received a message from {}: {}",
+            "Received a message from {}: {:?}",
             addr,
-            msg.to_text().unwrap()
+            msg
         );
+
         let peers = peer_map.lock().unwrap();
 
         // We want to broadcast the message to everyone except ourselves.
         let broadcast_recipients = peers
             .iter()
             .filter(|(peer_addr, _)| peer_addr != &&addr)
-            .map(|(_, ws_sink)| ws_sink);
+            .map(|(_, (ws_sink, port))| (ws_sink, port));
 
         for recp in broadcast_recipients {
-            recp.unbounded_send(msg.clone()).unwrap();
+            let recp_port = recp.1;
+
+            if *recp_port == path {
+                recp.0.unbounded_send(msg.clone()).unwrap();
+            }
         }
 
         future::ok(())

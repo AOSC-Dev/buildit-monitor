@@ -8,7 +8,8 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 #[tokio::main]
 async fn main() -> Result<()> {
     let path = Path::new("/home/saki/deploykit-backend");
-    let (ws_stream, _) = connect_async("ws://127.0.0.1:3000").await?;
+
+    let (ws_stream, _) = connect_async("ws://127.0.0.1:3000/22333").await?;
 
     Command::new("cargo")
         .arg("clean")
